@@ -1,0 +1,186 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>aiortc RTT demo</title>
+    <style>
+      body { font-family: sans-serif; }
+      video { width: 900px; background: #000; display:block; }
+      button { margin-right: 8px; }
+      pre { background:#111; color:#0f0; padding:10px; margin-top:10px; height:220px; overflow:auto; }
+      .row { margin-top: 10px; }
+      .metric { font-size: 14px; padding: 6px 10px; background:#eee; display:inline-block; border-radius: 6px; }
+    </style>
+  </head>
+
+  <body>
+    <h3>Pause/Resume 执行 RTT（DataChannel）</h3>
+
+    <video id="v" autoplay playsinline muted></video>
+
+    <div class="row">
+      <button id="pause" disabled>Pause / Resume</button>
+      <span class="metric" id="rtt">RTT: -- ms</span>
+      <span class="metric" id="lastAck">Last ACK: --</span>
+    </div>
+
+    <pre id="log"></pre>
+
+    <script>
+      const video = document.getElementById("v");
+      const logEl = document.getElementById("log");
+      const btnPause = document.getElementById("pause");
+      const rttEl = document.getElementById("rtt");
+      const lastAckEl = document.getElementById("lastAck");
+
+      function log(...args) {
+        const s = args.map(x => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
+        logEl.textContent += s + "\n";
+        logEl.scrollTop = logEl.scrollHeight;
+        console.log(...args);
+      }
+
+      function setButtonEnabled(enabled) {
+        btnPause.disabled = !enabled;
+      }
+
+      async function waitIceComplete(pc, timeoutMs = 60000) {
+        if (pc.iceGatheringState === "complete") return;
+
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            pc.removeEventListener("icegatheringstatechange", onChange);
+            reject(new Error("ICE gathering timeout"));
+          }, timeoutMs);
+
+          function onChange() {
+            if (pc.iceGatheringState === "complete") {
+              clearTimeout(timer);
+              pc.removeEventListener("icegatheringstatechange", onChange);
+              resolve();
+            }
+          }
+          pc.addEventListener("icegatheringstatechange", onChange);
+        });
+      }
+
+      // 用于 RTT：msg_id -> t0(performance.now)
+      const pending = new Map();
+      function newId() {
+        return (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + "-" + Math.random());
+      }
+
+      let pc = null;
+      let dc = null;
+      let paused = false;
+
+      async function start() {
+        setButtonEnabled(false);
+
+        pc = new RTCPeerConnection({
+          iceServers: [
+            { urls: "stun:stun.l.google.com:19302" },
+            { urls: "stun:stun1.l.google.com:19302" },
+            // TURN（需要时再加）
+          ]
+        });
+
+        pc.ontrack = (evt) => {
+          log("ontrack:", evt.track.kind);
+          video.srcObject = evt.streams[0];
+        };
+
+        pc.oniceconnectionstatechange = () => log("iceConnectionState:", pc.iceConnectionState);
+        pc.onconnectionstatechange = () => log("connectionState:", pc.connectionState);
+
+        // 必须：声明接收 video，确保 offer 里有 video m-line
+        pc.addTransceiver("video", { direction: "recvonly" });
+
+        dc = pc.createDataChannel("control");
+        dc.onopen = () => {
+          log("DataChannel open");
+          setButtonEnabled(true);
+        };
+        dc.onclose = () => {
+          log("DataChannel closed");
+          setButtonEnabled(false);
+        };
+        dc.onmessage = (e) => {
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg.type === "ack" && msg.id && pending.has(msg.id)) {
+              const t0 = pending.get(msg.id);
+              pending.delete(msg.id);
+              const rtt = performance.now() - t0;
+
+              rttEl.textContent = `RTT: ${rtt.toFixed(1)} ms`;
+
+              // 展示 ACK 细节：服务端帧号/状态
+              const detail = msg.cmd === "pause"
+                ? `pause=${msg.paused}, frame_idx=${msg.frame_idx}`
+                : `cmd=${msg.cmd}, frame_idx=${msg.frame_idx}`;
+              lastAckEl.textContent = `Last ACK: ${detail}`;
+              log("ACK:", msg, "RTT(ms)=", rtt.toFixed(1));
+            } else {
+              log("DataChannel msg:", msg);
+            }
+          } catch {
+            log("DataChannel msg (raw):", e.data);
+          }
+        };
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        try {
+          await waitIceComplete(pc, 8000);
+        } catch (e) {
+          log("WARN:", String(e), "(still sending SDP)");
+        }
+
+        const resp = await fetch("/offer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sdp: pc.localDescription.sdp,
+            type: pc.localDescription.type
+          })
+        });
+
+        const answer = await resp.json();
+        await pc.setRemoteDescription(answer);
+
+        log("WebRTC negotiation done");
+      }
+
+      function sendWithRtt(payload) {
+        if (!dc || dc.readyState !== "open") {
+          log("DataChannel not ready, state =", dc ? dc.readyState : "null");
+          return;
+        }
+        const id = newId();
+        const t0 = performance.now();
+        pending.set(id, t0);
+
+        dc.send(JSON.stringify({
+          ...payload,
+          id,
+          // 这个是给你展示用（客户端本地毫秒时间），不参与 RTT 计算（RTT 用 performance.now）
+          t_send_ms: Date.now()
+        }));
+      }
+
+      btnPause.onclick = () => {
+        paused = !paused;
+
+        // 发送 pause/resume 命令，并开始 RTT 计时
+        sendWithRtt({ cmd: "pause", paused });
+
+        // 你也可以在这里马上显示“正在请求…”
+        lastAckEl.textContent = `Last ACK: waiting... (pause=${paused})`;
+        log("SEND pause:", paused);
+      };
+
+      start().catch(err => log("start error:", String(err)));
+    </script>
+  </body>
+</html>
