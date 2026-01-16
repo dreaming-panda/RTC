@@ -1,0 +1,205 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Action Latencies</title>
+    <style>
+      body { font-family: sans-serif; }
+      video { width: 900px; background: #000; display:block; }
+      button { margin-right: 8px; margin-top: 10px; }
+      pre { background:#111; color:#0f0; padding:10px; margin-top:10px; height:240px; overflow:auto; }
+      .metric { font-size: 14px; padding: 6px 10px; background:#eee; display:inline-block; border-radius: 6px; margin-left: 8px; }
+      .row { margin-top: 10px; }
+    </style>
+  </head>
+
+  <body>
+    <h3>每个 action 的：infer start / infer end / visible latency</h3>
+
+    <video id="v" autoplay playsinline muted></video>
+
+    <div class="row">
+      <button id="btn" disabled>Send Action</button>
+      <input id="actionText" value="jump" style="width:220px;margin-left:8px;" />
+      <span class="metric" id="l1">InferStart: -- ms</span>
+      <span class="metric" id="l2">InferEnd: -- ms</span>
+      <span class="metric" id="l3">Visible: -- ms</span>
+      <span class="metric" id="last">Last: --</span>
+    </div>
+
+    <pre id="log"></pre>
+
+    <script>
+      const video = document.getElementById("v");
+      const logEl = document.getElementById("log");
+      const btn = document.getElementById("btn");
+      const actionInput = document.getElementById("actionText");
+
+      const l1 = document.getElementById("l1");
+      const l2 = document.getElementById("l2");
+      const l3 = document.getElementById("l3");
+      const lastEl = document.getElementById("last");
+
+      function log(...args) {
+        const s = args.map(x => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
+        logEl.textContent += s + "\n";
+        logEl.scrollTop = logEl.scrollHeight;
+        console.log(...args);
+      }
+
+      function setEnabled(ok) { btn.disabled = !ok; }
+
+      async function waitIceComplete(pc, timeoutMs = 8000) {
+        if (pc.iceGatheringState === "complete") return;
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            pc.removeEventListener("icegatheringstatechange", onChange);
+            reject(new Error("ICE gathering timeout"));
+          }, timeoutMs);
+          function onChange() {
+            if (pc.iceGatheringState === "complete") {
+              clearTimeout(timer);
+              pc.removeEventListener("icegatheringstatechange", onChange);
+              resolve();
+            }
+          }
+          pc.addEventListener("icegatheringstatechange", onChange);
+        });
+      }
+
+      function newId() {
+        return (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + "-" + Math.random());
+      }
+
+      let pc = null;
+      let dc = null;
+
+      // id -> {t_click, action, gotStart?, gotEnd?, gotApplied?}
+      const sent = new Map();
+
+      // 等待可视渲染
+      let waitingVisibleId = null;
+
+      function waitNextRenderFor(id) {
+        if (!("requestVideoFrameCallback" in HTMLVideoElement.prototype)) {
+          // fallback：估计 1 帧
+          setTimeout(() => {
+            const rec = sent.get(id);
+            if (!rec) return;
+            const rtt = performance.now() - rec.t_click;
+            l3.textContent = `Visible: ${rtt.toFixed(1)} ms`;
+            lastEl.textContent = `Last: visible(fallback) id=${id.slice(0,8)}`;
+            waitingVisibleId = null;
+          }, 34);
+          return;
+        }
+
+        video.requestVideoFrameCallback((_now, meta) => {
+          const rec = sent.get(id);
+          if (!rec) return;
+          const rtt = performance.now() - rec.t_click;
+          l3.textContent = `Visible: ${rtt.toFixed(1)} ms`;
+          lastEl.textContent = `Last: visible id=${id.slice(0,8)} presentedFrames=${meta.presentedFrames}`;
+          log("VISIBLE", id, rtt.toFixed(1), "ms");
+          waitingVisibleId = null;
+        });
+      }
+
+      async function start() {
+        setEnabled(false);
+
+        pc = new RTCPeerConnection({
+          iceServers: [
+            { urls: "stun:stun.l.google.com:19302" },
+            { urls: "stun:stun1.l.google.com:19302" },
+          ]
+        });
+
+        pc.ontrack = (evt) => {
+          log("ontrack:", evt.track.kind);
+          video.srcObject = evt.streams[0];
+        };
+
+        pc.oniceconnectionstatechange = () => log("iceConnectionState:", pc.iceConnectionState);
+        pc.onconnectionstatechange = () => log("connectionState:", pc.connectionState);
+
+        pc.addTransceiver("video", { direction: "recvonly" });
+
+        dc = pc.createDataChannel("control");
+        dc.onopen = () => { log("DataChannel open"); setEnabled(true); };
+        dc.onclose = () => { log("DataChannel closed"); setEnabled(false); };
+
+        dc.onmessage = (e) => {
+          let msg;
+          try { msg = JSON.parse(e.data); } catch { log("DC raw:", e.data); return; }
+
+          const id = msg.id;
+          if (!id || !sent.has(id)) {
+            // 只统计用户 action 的 id
+            return;
+          }
+          const rec = sent.get(id);
+
+          if (msg.type === "infer_start") {
+            const dt = performance.now() - rec.t_click;
+            l1.textContent = `InferStart: ${dt.toFixed(1)} ms`;
+            lastEl.textContent = `Last: infer_start id=${id.slice(0,8)} infer=${msg.infer_id}`;
+            rec.gotStart = true;
+            return;
+          }
+
+          if (msg.type === "infer_end") {
+            const dt = performance.now() - rec.t_click;
+            l2.textContent = `InferEnd: ${dt.toFixed(1)} ms`;
+            lastEl.textContent = `Last: infer_end id=${id.slice(0,8)} infer=${msg.infer_id}`;
+            rec.gotEnd = true;
+            return;
+          }
+
+          if (msg.type === "applied") {
+            // applied 表示：该 infer 的第0帧已经开始出队准备发送（已经包含 infer cost）
+            lastEl.textContent = `Last: applied id=${id.slice(0,8)} infer=${msg.infer_id}`;
+            waitingVisibleId = id;
+            waitNextRenderFor(id);
+            return;
+          }
+        };
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        try { await waitIceComplete(pc, 8000); } catch (e) { log("WARN:", String(e)); }
+
+        const resp = await fetch("/offer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
+        });
+
+        const answer = await resp.json();
+        await pc.setRemoteDescription(answer);
+        log("WebRTC negotiation done");
+      }
+
+      btn.onclick = () => {
+        if (!dc || dc.readyState !== "open") return;
+        const action = actionInput.value || "jump";
+        const id = newId();
+        const t_click = performance.now();
+
+        sent.set(id, { t_click, action, gotStart:false, gotEnd:false });
+
+        dc.send(JSON.stringify({
+          cmd: "action",
+          id,
+          action,
+          t_send_ms: Date.now()
+        }));
+
+        lastEl.textContent = `Last: sent id=${id.slice(0,8)} action=${action}`;
+        log("SENT:", {id, action});
+      };
+
+      start().catch(err => log("start error:", String(err)));
+    </script>
+  </body>
+</html>

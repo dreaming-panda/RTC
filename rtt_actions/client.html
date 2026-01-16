@@ -1,0 +1,208 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Action -> Visible RTT</title>
+    <style>
+      body { font-family: sans-serif; }
+      video { width: 900px; background: #000; display:block; }
+      button { margin-right: 8px; margin-top: 10px; }
+      pre { background:#111; color:#0f0; padding:10px; margin-top:10px; height:240px; overflow:auto; }
+      .metric { font-size: 14px; padding: 6px 10px; background:#eee; display:inline-block; border-radius: 6px; margin-left: 8px; }
+      .row { margin-top: 10px; }
+    </style>
+  </head>
+
+  <body>
+    <h3>单 step 一次 inference：Action 显示在视频中 + 可视 RTT</h3>
+
+    <video id="v" autoplay playsinline muted></video>
+
+    <div class="row">
+      <button id="btnAction" disabled>Trigger Action</button>
+      <input id="actionText" value="jump" style="width:200px;margin-left:8px;" />
+
+      <span class="metric" id="rttAck">ACK RTT: -- ms</span>
+      <span class="metric" id="rttVisible">Visible RTT: -- ms</span>
+      <span class="metric" id="last">Last: --</span>
+    </div>
+
+    <pre id="log"></pre>
+
+    <script>
+      const video = document.getElementById("v");
+      const logEl = document.getElementById("log");
+      const btn = document.getElementById("btnAction");
+      const actionInput = document.getElementById("actionText");
+
+      const rttAckEl = document.getElementById("rttAck");
+      const rttVisibleEl = document.getElementById("rttVisible");
+      const lastEl = document.getElementById("last");
+
+      function log(...args) {
+        const s = args.map(x => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
+        logEl.textContent += s + "\n";
+        logEl.scrollTop = logEl.scrollHeight;
+        console.log(...args);
+      }
+
+      function setEnabled(ok) {
+        btn.disabled = !ok;
+      }
+
+      async function waitIceComplete(pc, timeoutMs = 8000) {
+        if (pc.iceGatheringState === "complete") return;
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            pc.removeEventListener("icegatheringstatechange", onChange);
+            reject(new Error("ICE gathering timeout"));
+          }, timeoutMs);
+          function onChange() {
+            if (pc.iceGatheringState === "complete") {
+              clearTimeout(timer);
+              pc.removeEventListener("icegatheringstatechange", onChange);
+              resolve();
+            }
+          }
+          pc.addEventListener("icegatheringstatechange", onChange);
+        });
+      }
+
+      function newId() {
+        return (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + "-" + Math.random());
+      }
+
+      let pc = null;
+      let dc = null;
+
+      // id -> {t_click}
+      const sent = new Map();
+
+      // 用于“可视 RTT”：当收到 applied(id) 后，等下一次视频帧渲染回调
+      let waitingForRenderId = null;
+
+      function requestNextRenderCallback() {
+        if (!("requestVideoFrameCallback" in HTMLVideoElement.prototype)) {
+          // Safari/老浏览器可能没有这个 API
+          log("WARN: requestVideoFrameCallback not supported; visible RTT may be inaccurate.");
+          // 退化：用 setTimeout 模拟 1 帧
+          setTimeout(() => {
+            if (waitingForRenderId && sent.has(waitingForRenderId)) {
+              const t0 = sent.get(waitingForRenderId).t_click;
+              const rtt = performance.now() - t0;
+              rttVisibleEl.textContent = `Visible RTT: ${rtt.toFixed(1)} ms`;
+              lastEl.textContent = `Last: visible (fallback) id=${waitingForRenderId.slice(0,8)}`;
+              waitingForRenderId = null;
+            }
+          }, 34);
+          return;
+        }
+
+        video.requestVideoFrameCallback((_now, metadata) => {
+          if (waitingForRenderId && sent.has(waitingForRenderId)) {
+            const t0 = sent.get(waitingForRenderId).t_click;
+            const rtt = performance.now() - t0;
+            rttVisibleEl.textContent = `Visible RTT: ${rtt.toFixed(1)} ms`;
+            lastEl.textContent = `Last: visible id=${waitingForRenderId.slice(0,8)} (presentedFrames=${metadata.presentedFrames})`;
+            log("VISIBLE RTT for", waitingForRenderId, "=", rtt.toFixed(1), "ms");
+            waitingForRenderId = null;
+          } else {
+            // 不是我们等的那次，就继续挂下一次
+            requestNextRenderCallback();
+          }
+        });
+      }
+
+      async function start() {
+        setEnabled(false);
+
+        pc = new RTCPeerConnection({
+          iceServers: [
+            { urls: "stun:stun.l.google.com:19302" },
+            { urls: "stun:stun1.l.google.com:19302" },
+            // 云上若 failed，通常需要 TURN
+          ]
+        });
+
+        pc.ontrack = (evt) => {
+          log("ontrack:", evt.track.kind);
+          video.srcObject = evt.streams[0];
+        };
+
+        pc.oniceconnectionstatechange = () => log("iceConnectionState:", pc.iceConnectionState);
+        pc.onconnectionstatechange = () => log("connectionState:", pc.connectionState);
+
+        // 必须：显式接收 video
+        pc.addTransceiver("video", { direction: "recvonly" });
+
+        dc = pc.createDataChannel("control");
+        dc.onopen = () => { log("DataChannel open"); setEnabled(true); };
+        dc.onclose = () => { log("DataChannel closed"); setEnabled(false); };
+        dc.onmessage = (e) => {
+          let msg;
+          try { msg = JSON.parse(e.data); } catch { log("DC raw:", e.data); return; }
+
+          if (msg.type === "ack" && msg.id && sent.has(msg.id)) {
+            const t0 = sent.get(msg.id).t_click;
+            const rtt = performance.now() - t0;
+            rttAckEl.textContent = `ACK RTT: ${rtt.toFixed(1)} ms`;
+            lastEl.textContent = `Last: ack id=${msg.id.slice(0,8)} action=${msg.action}`;
+            log("ACK:", msg, "ACK_RTT(ms)=", rtt.toFixed(1));
+            return;
+          }
+
+          if (msg.type === "applied" && msg.id && sent.has(msg.id)) {
+            // 服务器表示：某一帧已经把 action 画出来了
+            lastEl.textContent = `Last: applied id=${msg.id.slice(0,8)} frame_seq=${msg.frame_seq}`;
+            log("APPLIED:", msg);
+
+            // 关键：等“下一次视频帧真正渲染”作为“你能看到”的时刻
+            waitingForRenderId = msg.id;
+            requestNextRenderCallback();
+            return;
+          }
+
+          log("DC msg:", msg);
+        };
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        try { await waitIceComplete(pc, 8000); } catch (e) { log("WARN:", String(e)); }
+
+        const resp = await fetch("/offer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
+        });
+
+        const answer = await resp.json();
+        await pc.setRemoteDescription(answer);
+        log("WebRTC negotiation done");
+      }
+
+      btn.onclick = () => {
+        if (!dc || dc.readyState !== "open") {
+          log("DataChannel not ready");
+          return;
+        }
+        const action = actionInput.value || "jump";
+        const id = newId();
+        const t_click = performance.now();
+
+        sent.set(id, { t_click, action });
+
+        dc.send(JSON.stringify({
+          cmd: "action",
+          action,
+          id,
+          t_send_ms: Date.now()
+        }));
+
+        lastEl.textContent = `Last: sent id=${id.slice(0,8)} action=${action}`;
+        log("SENT action:", {id, action});
+      };
+
+      start().catch(err => log("start error:", String(err)));
+    </script>
+  </body>
+</html>
