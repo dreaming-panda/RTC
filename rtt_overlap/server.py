@@ -4,7 +4,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Set, Dict
+from typing import List, Optional, Set
 
 import numpy as np
 import av
@@ -27,13 +27,11 @@ except Exception:
 ACTIONS_PER_INFER = 4
 FRAMES_PER_INFER = 16
 
-
 ICE_CONFIG = RTCConfiguration(
     iceServers=[
         RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
         RTCIceServer(urls=["stun:stun1.l.google.com:19302"]),
         # 如云上仍 failed，需要 TURN
-        # RTCIceServer(urls=["turn:YOUR_TURN:3478?transport=udp"], username="u", credential="p"),
     ]
 )
 
@@ -68,15 +66,14 @@ class FrameItem:
     img: np.ndarray
     infer_id: int
     frame_index: int
-    # 为了鲁棒：每一帧都带 user_actions，避免队列很小/丢帧导致拿不到“第0帧”
-    user_actions: List[Action]
+    user_actions: List[Action]  # every frame carries user_actions for robustness
 
 
 class BatchEngine:
     """
     蓝色正弦波纹。
     blank action 不改变颜色状态；
-    user action 出现则推进 color_phase，导致整体颜色变化。
+    user action 出现则推进 color_phase（颜色变化）。
     """
     def __init__(self, w=640, h=360):
         self.w = w
@@ -95,12 +92,10 @@ class BatchEngine:
     def _apply_actions(self, actions: List[Action]):
         user_cnt = sum(1 for a in actions if a.is_user and a.id)
         if user_cnt > 0:
-            # 一次 batch 只要出现 user action，就变一次色
             self.color_phase += 0.8
 
     def infer(self, infer_id: int, actions: List[Action], output_fps: float) -> List[np.ndarray]:
         self._apply_actions(actions)
-
         user_texts = [a.text for a in actions if a.is_user and a.id]
         actions_text = " | ".join(user_texts) if user_texts else "(none)"
 
@@ -110,7 +105,7 @@ class BatchEngine:
         base_g = 0.25 + 0.25 * np.sin(cp + 2.1)
         base_b = 0.75 + 0.20 * np.sin(cp + 4.2)
 
-        for k in range(FRAMES_PER_INFER):
+        for _ in range(FRAMES_PER_INFER):
             t = (self.global_frame_seq / max(output_fps, 1e-6)) * self.speed
             phase = self.freq * self.rr * (2.0 * np.pi) - t
             wave = (np.sin(phase) * 0.5 + 0.5).astype(np.float32)
@@ -138,17 +133,52 @@ class BatchEngine:
         return frames
 
 
+class PIController:
+    """
+    e = qsize - target_q
+    e>0 -> queue too big -> scale↑ (infer slower)
+    e<0 -> queue too small -> scale↓ (infer faster)
+    """
+    def __init__(
+        self,
+        target_q: float = 8.0,
+        kp: float = 0.06,
+        ki: float = 0.02,
+        scale_min: float = 0.60,
+        scale_max: float = 3.00,
+        integrator_min: float = -20.0,
+        integrator_max: float = 20.0,
+    ):
+        self.target_q = float(target_q)
+        self.kp = float(kp)
+        self.ki = float(ki)
+        self.scale_min = float(scale_min)
+        self.scale_max = float(scale_max)
+        self.integrator_min = float(integrator_min)
+        self.integrator_max = float(integrator_max)
+
+        self.integral = 0.0
+        self.scale = 1.0
+        self._last_t = time.time()
+
+    def update(self, qsize: float) -> float:
+        now = time.time()
+        dt = max(0.001, now - self._last_t)
+        self._last_t = now
+
+        e = float(qsize) - self.target_q
+
+        self.integral += e * dt
+        self.integral = max(self.integrator_min, min(self.integrator_max, self.integral))
+
+        u = self.kp * e + self.ki * self.integral
+        scale = 1.0 + u
+        scale = max(self.scale_min, min(self.scale_max, scale))
+        self.scale = scale
+        return scale
+
+
 class Pipeline:
-    """
-    - 周期触发：每次 infer 需要 4 个 action，不够用 blank 补齐
-    - 模拟 infer：await asyncio.sleep(sim_infer_ms/1000)
-    - 事件追踪（仅对 user action）：
-        ack：收到即发（在 on_message 里）
-        infer_start：开始 infer 前发
-        infer_end：infer 完成后发（含 infer_ms）
-        applied：当该 infer 的第一帧真正出队准备发送时发（在 VideoTrack 触发）
-    - stats：每 0.5s 推送 frame_q size 等
-    """
     def __init__(
         self,
         engine: BatchEngine,
@@ -156,11 +186,15 @@ class Pipeline:
         sim_infer_ms: int,
         frame_queue_max: int,
         action_collect_timeout_sec: float,
+        controller: PIController,
+        infer_in_thread: bool = True,
     ):
         self.engine = engine
         self.output_fps = float(output_fps)
         self.sim_infer_ms = int(sim_infer_ms)
         self.action_collect_timeout_sec = float(action_collect_timeout_sec)
+        self.controller = controller
+        self.infer_in_thread = bool(infer_in_thread)
 
         self.action_q: asyncio.Queue[Action] = asyncio.Queue()
         self.frame_q: asyncio.Queue[FrameItem] = asyncio.Queue(maxsize=frame_queue_max)
@@ -172,6 +206,11 @@ class Pipeline:
 
         self._last_frame: Optional[FrameItem] = None
         self._last_infer_ms: float = 0.0
+        self._last_scale: float = 1.0
+        self._last_q_before: int = 0
+        self._last_q_after: int = 0
+
+        self._last_infer_stats_push_t = 0.0
 
     def add_dc(self, dc):
         self.datachannels.add(dc)
@@ -243,10 +282,16 @@ class Pipeline:
             return item
 
     async def _run(self):
-        infer_period_sec = FRAMES_PER_INFER / max(self.output_fps, 1e-6)
+        base_period = FRAMES_PER_INFER / max(self.output_fps, 1e-6)
         next_tick = time.time()
 
         while not self._stop.is_set():
+            # adaptive control based on current queue size
+            q_now = self.frame_q.qsize()
+            scale = self.controller.update(q_now)
+            self._last_scale = scale
+            infer_period_sec = base_period * scale
+
             now = time.time()
             if now < next_tick:
                 await asyncio.sleep(min(0.01, next_tick - now))
@@ -259,7 +304,7 @@ class Pipeline:
             self._infer_id += 1
             infer_id = self._infer_id
 
-            # infer_start（只对 user）
+            # infer_start (user actions only)
             t_start_ms = int(time.time() * 1000)
             for a in user_actions:
                 self.broadcast({
@@ -270,18 +315,33 @@ class Pipeline:
                     "t_server_ms": t_start_ms,
                 })
 
-            # 模拟 infer cost（语义正确）
+            # overlap evidence: q_before/q_after across inference duration
+            q_before = self.frame_q.qsize()
             infer_t0 = time.time()
+
+            # simulate compute without blocking event loop
             if self.sim_infer_ms > 0:
                 await asyncio.sleep(self.sim_infer_ms / 1000.0)
 
-            # 生成 frames（你换成真实模型即可）
-            frames = self.engine.infer(infer_id=infer_id, actions=actions, output_fps=self.output_fps)
+            # run engine.infer in a background thread (so recv() keeps running)
+            if self.infer_in_thread:
+                frames = await asyncio.to_thread(self.engine.infer, infer_id, actions, self.output_fps)
+            else:
+                frames = self.engine.infer(infer_id, actions, self.output_fps)
+
             infer_t1 = time.time()
+            q_after = self.frame_q.qsize()
+
+            self._last_q_before = int(q_before)
+            self._last_q_after = int(q_after)
+
             infer_ms = (infer_t1 - infer_t0) * 1000.0
             self._last_infer_ms = infer_ms
 
-            # infer_end（只对 user），带 infer_ms
+            print(f"[INFER] infer_id={infer_id:4d} dt={infer_ms:7.1f}ms "
+                  f"q_before={q_before:3d} q_after={q_after:3d} scale={self._last_scale:.3f}")
+
+            # infer_end (user actions only)
             t_end_ms = int(time.time() * 1000)
             for a in user_actions:
                 self.broadcast({
@@ -293,29 +353,37 @@ class Pipeline:
                     "t_server_ms": t_end_ms,
                 })
 
-            # 入队 16 帧：队列满则丢“最旧”(drop-oldest)
+            # enqueue 16 frames; drop-oldest on overflow
             for idx, img in enumerate(frames):
                 if self.frame_q.full():
                     try:
                         _ = self.frame_q.get_nowait()
                     except asyncio.QueueEmpty:
                         pass
-
                 await self.frame_q.put(FrameItem(
                     img=img,
                     infer_id=infer_id,
                     frame_index=idx,
-                    user_actions=user_actions,  # 每帧都带，鲁棒
+                    user_actions=user_actions,
                 ))
 
-            # 推一个 infer 统计（方便你对照）
-            self.broadcast({
-                "type": "infer_stats",
-                "infer_id": infer_id,
-                "infer_ms": round(infer_ms, 2),
-                "frame_q_after": self.frame_q.qsize(),
-                "ts_ms": int(time.time() * 1000),
-            })
+            # push infer_stats (contains q_before/q_after) to browser
+            t = time.time()
+            if t - self._last_infer_stats_push_t > 0.25:
+                self._last_infer_stats_push_t = t
+                self.broadcast({
+                    "type": "infer_stats",
+                    "infer_id": infer_id,
+                    "infer_ms": round(infer_ms, 2),
+                    "frame_q_after_enqueue": self.frame_q.qsize(),
+                    "scale": round(self._last_scale, 3),
+                    "target_q": self.controller.target_q,
+                    "base_period_ms": round(base_period * 1000.0, 2),
+                    "infer_period_ms": round(infer_period_sec * 1000.0, 2),
+                    "q_before": int(q_before),
+                    "q_after": int(q_after),
+                    "ts_ms": int(time.time() * 1000),
+                })
 
 
 class PipelineVideoTrack(VideoStreamTrack):
@@ -332,7 +400,7 @@ class PipelineVideoTrack(VideoStreamTrack):
         self._last_stats_push_t = 0.0
 
     async def recv(self):
-        # fps 节流（模拟发送端固定帧率输出）
+        # throttle by output_fps
         now = time.time()
         if self._last is not None:
             delay = self._interval - (now - self._last)
@@ -343,7 +411,7 @@ class PipelineVideoTrack(VideoStreamTrack):
         item = await self.pipeline.get_frame_item()
         qsize = self.pipeline.frame_q.qsize()
 
-        # applied：当该 infer 的“第一帧开始出队并准备发送”时发（包含 infer cost + 排队）
+        # applied: when this infer's first dequeued frame is about to be sent
         if item.infer_id not in self._applied_sent_for_infer and item.user_actions:
             self._applied_sent_for_infer.add(item.infer_id)
             t_applied_ms = int(time.time() * 1000)
@@ -356,15 +424,17 @@ class PipelineVideoTrack(VideoStreamTrack):
                     "t_server_ms": t_applied_ms,
                 })
 
-        # stdout 打印 frame_q（每 0.5s）
+        # stdout: frame_q tracing
         t = time.time()
         if t - self._last_log_t > 0.5:
             self._last_log_t = t
-            print(f"[FRAME_Q] size={qsize:3d} | infer_id={item.infer_id:4d} | idx={item.frame_index:2d}")
+            print(f"[FRAME_Q] size={qsize:3d} | infer_id={item.infer_id:4d} | idx={item.frame_index:2d} "
+                  f"| scale={self.pipeline._last_scale:.3f} | q_before/after={self.pipeline._last_q_before}/{self.pipeline._last_q_after}")
 
-        # 推 stats 给前端（每 0.5s）
+        # push stats to browser
         if t - self._last_stats_push_t > 0.5:
             self._last_stats_push_t = t
+            est_queue_ms = (qsize / max(self.pipeline.output_fps, 1e-6)) * 1000.0
             self.pipeline.broadcast({
                 "type": "stats",
                 "frame_q": qsize,
@@ -372,6 +442,11 @@ class PipelineVideoTrack(VideoStreamTrack):
                 "frame_index": item.frame_index,
                 "output_fps": self.pipeline.output_fps,
                 "last_infer_ms": round(self.pipeline._last_infer_ms, 2),
+                "scale": round(self.pipeline._last_scale, 3),
+                "target_q": self.pipeline.controller.target_q,
+                "est_queue_ms": round(est_queue_ms, 1),
+                "last_q_before": self.pipeline._last_q_before,
+                "last_q_after": self.pipeline._last_q_after,
                 "ts_ms": int(time.time() * 1000),
             })
 
@@ -434,7 +509,7 @@ def make_app(pipeline: Pipeline):
                 )
                 asyncio.create_task(pipeline.enqueue_action(a))
 
-                # ACK：收到并入队（不包含 infer cost）
+                # ack: received + enqueued
                 try:
                     dc.send(json.dumps({
                         "type": "ack",
@@ -477,25 +552,45 @@ def make_app(pipeline: Pipeline):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--host", default="0.0.0.0")
-    p.add_argument("--port", type=int, default=8090)
+    p.add_argument("--port", type=int, default=8080)
+
     p.add_argument("--fps", type=float, default=30.0, help="OUTPUT_FPS")
-    p.add_argument("--sim-infer-ms", type=int, default=0, help="simulate infer cost in ms")
+    p.add_argument("--sim-infer-ms", type=int, default=0, help="simulate infer time in ms (non-blocking)")
     p.add_argument("--frame-queue-max", type=int, default=128)
     p.add_argument("--action-collect-timeout-ms", type=int, default=30)
+
+    # adaptive PI control parameters
+    p.add_argument("--target-q", type=float, default=8.0)
+    p.add_argument("--kp", type=float, default=0.00)
+    p.add_argument("--ki", type=float, default=0.00)
+    p.add_argument("--scale-min", type=float, default=0.60)
+    p.add_argument("--scale-max", type=float, default=3.00)
+
+    p.add_argument("--infer-in-thread", action="store_true", default=True,
+                   help="run engine.infer in background thread to overlap with recv()")
     args = p.parse_args()
 
     engine = BatchEngine(w=640, h=360)
+    controller = PIController(
+        target_q=args.target_q,
+        kp=args.kp,
+        ki=args.ki,
+        scale_min=args.scale_min,
+        scale_max=args.scale_max,
+    )
+
     pipeline = Pipeline(
         engine=engine,
         output_fps=args.fps,
         sim_infer_ms=args.sim_infer_ms,
         frame_queue_max=args.frame_queue_max,
         action_collect_timeout_sec=args.action_collect_timeout_ms / 1000.0,
+        controller=controller,
+        infer_in_thread=args.infer_in_thread,
     )
 
-    if args.frame_queue_max < FRAMES_PER_INFER:
-        print(f"[WARN] frame_queue_max({args.frame_queue_max}) < FRAMES_PER_INFER({FRAMES_PER_INFER}); "
-              f"may drop within a batch. Applied is still robust (user_actions on every frame).")
+    print(f"[CTRL] target_q={controller.target_q} kp={controller.kp} ki={controller.ki} "
+          f"scale_range=[{controller.scale_min},{controller.scale_max}] infer_in_thread={args.infer_in_thread}")
 
     web.run_app(make_app(pipeline), host=args.host, port=args.port)
 
