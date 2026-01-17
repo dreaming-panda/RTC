@@ -1,0 +1,233 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>WebRTC Action RTT Tracker</title>
+    <style>
+      body { font-family: sans-serif; }
+      video { width: 900px; background: #000; display:block; }
+      button { margin-right: 8px; margin-top: 10px; }
+      pre { background:#111; color:#0f0; padding:10px; margin-top:10px; height:260px; overflow:auto; }
+      .metric { font-size: 14px; padding: 6px 10px; background:#eee; display:inline-block; border-radius: 6px; margin: 6px 8px 0 0; }
+      .row { margin-top: 10px; }
+      .small { font-size: 12px; opacity: 0.8; }
+    </style>
+  </head>
+
+  <body>
+    <h3>Action → infer_start / infer_end / visible RTT + frame_q stats</h3>
+
+    <video id="v" autoplay playsinline muted></video>
+
+    <div class="row">
+      <button id="btn" disabled>Send Action</button>
+      <input id="actionText" value="hit" style="width:220px;margin-left:8px;" />
+    </div>
+
+    <div class="row">
+      <span class="metric" id="ack">ACK RTT: -- ms</span>
+      <span class="metric" id="s">InferStart: -- ms</span>
+      <span class="metric" id="e">InferEnd: -- ms</span>
+      <span class="metric" id="vlat">Visible: -- ms</span>
+      <span class="metric" id="last">Last: --</span>
+    </div>
+
+    <div class="row">
+      <span class="metric" id="q">frame_q: --</span>
+      <span class="metric" id="inf">infer_id/idx: --</span>
+      <span class="metric" id="fps">fps: --</span>
+      <span class="metric" id="im">last_infer_ms: --</span>
+      <span class="metric" id="cs">conn: --</span>
+      <span class="metric small" id="hint">提示：visible≈infer_end + (frame_q / fps) + jitterbuffer</span>
+    </div>
+
+    <pre id="log"></pre>
+
+    <script>
+      const video = document.getElementById("v");
+      const logEl = document.getElementById("log");
+      const btn = document.getElementById("btn");
+      const actionInput = document.getElementById("actionText");
+
+      const ackEl = document.getElementById("ack");
+      const sEl = document.getElementById("s");
+      const eEl = document.getElementById("e");
+      const vEl = document.getElementById("vlat");
+      const lastEl = document.getElementById("last");
+
+      const qEl = document.getElementById("q");
+      const infEl = document.getElementById("inf");
+      const fpsEl = document.getElementById("fps");
+      const imEl = document.getElementById("im");
+      const csEl = document.getElementById("cs");
+
+      function log(...args) {
+        const s = args.map(x => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
+        logEl.textContent += s + "\n";
+        logEl.scrollTop = logEl.scrollHeight;
+        console.log(...args);
+      }
+
+      function setEnabled(ok) { btn.disabled = !ok; }
+
+      async function waitIceComplete(pc, timeoutMs = 8000) {
+        if (pc.iceGatheringState === "complete") return;
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            pc.removeEventListener("icegatheringstatechange", onChange);
+            reject(new Error("ICE gathering timeout"));
+          }, timeoutMs);
+          function onChange() {
+            if (pc.iceGatheringState === "complete") {
+              clearTimeout(timer);
+              pc.removeEventListener("icegatheringstatechange", onChange);
+              resolve();
+            }
+          }
+          pc.addEventListener("icegatheringstatechange", onChange);
+        });
+      }
+
+      function newId() {
+        return (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + "-" + Math.random());
+      }
+
+      let pc = null;
+      let dc = null;
+
+      // actionId -> {t_click}
+      const sent = new Map();
+
+      function waitNextRenderFor(id) {
+        if (!("requestVideoFrameCallback" in HTMLVideoElement.prototype)) {
+          setTimeout(() => {
+            const rec = sent.get(id);
+            if (!rec) return;
+            const dt = performance.now() - rec.t_click;
+            vEl.textContent = `Visible: ${dt.toFixed(1)} ms`;
+            lastEl.textContent = `Last: visible(fallback) id=${id.slice(0,8)}`;
+          }, 34);
+          return;
+        }
+        video.requestVideoFrameCallback((_now, meta) => {
+          const rec = sent.get(id);
+          if (!rec) return;
+          const dt = performance.now() - rec.t_click;
+          vEl.textContent = `Visible: ${dt.toFixed(1)} ms`;
+          lastEl.textContent = `Last: visible id=${id.slice(0,8)} presentedFrames=${meta.presentedFrames}`;
+          log("VISIBLE", id, dt.toFixed(1), "ms");
+        });
+      }
+
+      async function start() {
+        setEnabled(false);
+
+        pc = new RTCPeerConnection({
+          iceServers: [
+            { urls: "stun:stun.l.google.com:19302" },
+            { urls: "stun:stun1.l.google.com:19302" },
+          ]
+        });
+
+        pc.ontrack = (evt) => {
+          video.srcObject = evt.streams[0];
+          log("ontrack:", evt.track.kind);
+        };
+
+        pc.oniceconnectionstatechange = () => log("iceConnectionState:", pc.iceConnectionState);
+        pc.onconnectionstatechange = () => {
+          csEl.textContent = `conn: ${pc.connectionState}/${pc.iceConnectionState}`;
+          log("connectionState:", pc.connectionState);
+        };
+
+        pc.addTransceiver("video", { direction: "recvonly" });
+
+        dc = pc.createDataChannel("control");
+        dc.onopen = () => { log("DataChannel open"); setEnabled(true); };
+        dc.onclose = () => { log("DataChannel closed"); setEnabled(false); };
+
+        dc.onmessage = (e) => {
+          let msg;
+          try { msg = JSON.parse(e.data); } catch { return; }
+
+          if (msg.type === "stats") {
+            qEl.textContent = `frame_q: ${msg.frame_q}`;
+            infEl.textContent = `infer_id/idx: ${msg.infer_id}/${msg.frame_index}`;
+            fpsEl.textContent = `fps: ${msg.output_fps}`;
+            imEl.textContent = `last_infer_ms: ${msg.last_infer_ms}`;
+            return;
+          }
+
+          if (msg.type === "infer_stats") {
+            log("INFER_STATS", msg);
+            return;
+          }
+
+          const id = msg.id;
+          if (id && sent.has(id)) {
+            const rec = sent.get(id);
+            const dt = performance.now() - rec.t_click;
+
+            if (msg.type === "ack") {
+              ackEl.textContent = `ACK RTT: ${dt.toFixed(1)} ms`;
+              lastEl.textContent = `Last: ack id=${id.slice(0,8)} action=${msg.action}`;
+              return;
+            }
+
+            if (msg.type === "infer_start") {
+              sEl.textContent = `InferStart: ${dt.toFixed(1)} ms`;
+              lastEl.textContent = `Last: infer_start id=${id.slice(0,8)} infer=${msg.infer_id}`;
+              return;
+            }
+
+            if (msg.type === "infer_end") {
+              eEl.textContent = `InferEnd: ${dt.toFixed(1)} ms (infer_ms=${msg.infer_ms})`;
+              lastEl.textContent = `Last: infer_end id=${id.slice(0,8)} infer=${msg.infer_id}`;
+              return;
+            }
+
+            if (msg.type === "applied") {
+              lastEl.textContent = `Last: applied id=${id.slice(0,8)} infer=${msg.infer_id}`;
+              waitNextRenderFor(id);
+              return;
+            }
+          }
+        };
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        try { await waitIceComplete(pc, 8000); } catch (e) { log("WARN:", String(e)); }
+
+        const resp = await fetch("/offer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
+        });
+
+        const answer = await resp.json();
+        await pc.setRemoteDescription(answer);
+        log("WebRTC negotiation done");
+      }
+
+      btn.onclick = () => {
+        if (!dc || dc.readyState !== "open") return;
+        const action = actionInput.value || "hit";
+        const id = newId();
+
+        sent.set(id, { t_click: performance.now(), action });
+
+        dc.send(JSON.stringify({
+          cmd: "action",
+          id,
+          action,
+          t_send_ms: Date.now()
+        }));
+
+        lastEl.textContent = `Last: sent id=${id.slice(0,8)} action=${action}`;
+        log("SENT", {id, action});
+      };
+
+      start().catch(err => log("start error:", String(err)));
+    </script>
+  </body>
+</html>
