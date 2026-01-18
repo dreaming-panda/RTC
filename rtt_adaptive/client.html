@@ -2,24 +2,21 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>WebRTC Action RTT + Jitter Buffer (Chrome)</title>
+    <title>Dual Adaptive FPS (infer + send)</title>
     <style>
       body { font-family: sans-serif; }
       video { width: 900px; background: #000; display:block; }
       button { margin-right: 8px; margin-top: 10px; }
-      input[type="range"] { width: 320px; vertical-align: middle; }
       pre { background:#111; color:#0f0; padding:10px; margin-top:10px; height:260px; overflow:auto; }
       .metric { font-size: 14px; padding: 6px 10px; background:#eee; display:inline-block; border-radius: 6px; margin: 6px 8px 0 0; }
       .row { margin-top: 10px; }
       .small { font-size: 12px; opacity: 0.85; }
       .hl { background:#dff7df; }
-      .warn { background:#ffe3e3; }
-      .label { display:inline-block; min-width: 190px; }
     </style>
   </head>
 
   <body>
-    <h3>Action RTT + frame_q + q_before/q_after + Chrome jitterBufferTarget</h3>
+    <h3>Dual self-adaptive FPS: infer_fps (production) + send_fps (consumption)</h3>
 
     <video id="v" autoplay playsinline muted></video>
 
@@ -39,31 +36,12 @@
     <div class="row">
       <span class="metric" id="q">frame_q: --</span>
       <span class="metric" id="inf">infer_id/idx: --</span>
-      <span class="metric" id="fps">fps: --</span>
-      <span class="metric" id="im">last_infer_ms: --</span>
-      <span class="metric" id="sc">scale/target: --</span>
+      <span class="metric" id="send">send_fps: --</span>
+      <span class="metric" id="infer">infer_fps: --</span>
       <span class="metric" id="eq">est_queue: -- ms</span>
+      <span class="metric" id="im">last_infer_ms: --</span>
       <span class="metric hl" id="qb">q_before/q_after: --/--</span>
-      <span class="metric small" id="hint">若推理期间 q_after &lt; q_before，说明推理与发送旧帧发生重叠</span>
-    </div>
-
-    <hr />
-
-    <div class="row">
-      <span class="label"><b>Chrome jitterBufferTarget</b> (ms):</span>
-      <input id="jbRange" type="range" min="0" max="300" step="5" value="30" />
-      <span class="metric" id="jbSet">set: 30 ms</span>
-      <button id="applyJb" disabled>Apply</button>
-      <span class="metric small" id="jbSupport">support: --</span>
-    </div>
-
-    <div class="row">
-      <span class="metric" id="jbAvg">avg jitter buffer: -- ms</span>
-      <span class="metric" id="jbTgt">stats targetDelay: -- ms</span>
-      <span class="metric" id="pkLoss">packetsLost: --</span>
-      <span class="metric" id="jitter">jitter: -- ms</span>
-      <span class="metric" id="drop">framesDropped: --</span>
-      <span class="metric small" id="jbNote">提示：target 是“偏好”，网络抖动大时 Chrome 可能仍增大 buffer 防卡</span>
+      <span class="metric small" id="hint">q_after&lt;q_before 表示推理期间旧帧被持续发送（发生重合）</span>
     </div>
 
     <pre id="log"></pre>
@@ -82,22 +60,11 @@
 
       const qEl = document.getElementById("q");
       const infEl = document.getElementById("inf");
-      const fpsEl = document.getElementById("fps");
-      const imEl = document.getElementById("im");
-      const scEl = document.getElementById("sc");
+      const sendEl = document.getElementById("send");
+      const inferEl = document.getElementById("infer");
       const eqEl = document.getElementById("eq");
+      const imEl = document.getElementById("im");
       const qbEl = document.getElementById("qb");
-
-      const jbRange = document.getElementById("jbRange");
-      const jbSet = document.getElementById("jbSet");
-      const applyJbBtn = document.getElementById("applyJb");
-      const jbSupport = document.getElementById("jbSupport");
-
-      const jbAvg = document.getElementById("jbAvg");
-      const jbTgt = document.getElementById("jbTgt");
-      const pkLoss = document.getElementById("pkLoss");
-      const jitterEl = document.getElementById("jitter");
-      const dropEl = document.getElementById("drop");
 
       function log(...args) {
         const s = args.map(x => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
@@ -107,7 +74,6 @@
       }
 
       function setEnabled(ok) { btn.disabled = !ok; }
-      function setJbEnabled(ok) { applyJbBtn.disabled = !ok; }
 
       async function waitIceComplete(pc, timeoutMs = 8000) {
         if (pc.iceGatheringState === "complete") return;
@@ -134,8 +100,7 @@
       let pc = null;
       let dc = null;
 
-      // actionId -> {t_click}
-      const sent = new Map();
+      const sent = new Map(); // actionId -> {t_click}
 
       function waitNextRenderFor(id) {
         if (!("requestVideoFrameCallback" in HTMLVideoElement.prototype)) {
@@ -158,95 +123,8 @@
         });
       }
 
-      function getVideoReceiver(pc) {
-        const tr = pc.getTransceivers().find(t => t.receiver?.track?.kind === "video");
-        return tr ? tr.receiver : null;
-      }
-
-      function setVideoJitterBufferTarget(pc, targetMs) {
-        const r = getVideoReceiver(pc);
-        if (!r) return { ok: false, reason: "no video receiver" };
-
-        if ("jitterBufferTarget" in r) {
-          try {
-            r.jitterBufferTarget = targetMs; // ms
-            return { ok: true };
-          } catch (e) {
-            return { ok: false, reason: String(e) };
-          }
-        }
-        return { ok: false, reason: "jitterBufferTarget not supported" };
-      }
-
-      function updateJbSupportUI() {
-        if (!pc) return;
-        const r = getVideoReceiver(pc);
-        if (!r) { jbSupport.textContent = "support: no receiver"; return; }
-        if ("jitterBufferTarget" in r) {
-          jbSupport.textContent = "support: jitterBufferTarget ✅";
-          jbSupport.className = "metric";
-        } else {
-          jbSupport.textContent = "support: jitterBufferTarget ❌";
-          jbSupport.className = "metric warn";
-        }
-      }
-
-      async function startJitterStats(pc) {
-        const r = getVideoReceiver(pc);
-        if (!r) return;
-
-        setInterval(async () => {
-          try {
-            const report = await r.getStats();
-            for (const s of report.values()) {
-              if (s.type === "inbound-rtp" && (s.kind === "video" || s.mediaType === "video")) {
-                // avg jitter buffer (ms): jitterBufferDelay (seconds cumulative) / emittedCount
-                let avgJbMs = null;
-                if (typeof s.jitterBufferDelay === "number" &&
-                    typeof s.jitterBufferEmittedCount === "number" &&
-                    s.jitterBufferEmittedCount > 0) {
-                  avgJbMs = (s.jitterBufferDelay / s.jitterBufferEmittedCount) * 1000.0;
-                }
-
-                const targetDelayMs = (typeof s.jitterBufferTargetDelay === "number")
-                  ? (s.jitterBufferTargetDelay * 1000.0)
-                  : null;
-
-                const jitterMs = (typeof s.jitter === "number") ? (s.jitter * 1000.0) : null;
-
-                jbAvg.textContent = `avg jitter buffer: ${avgJbMs === null ? "--" : avgJbMs.toFixed(1)} ms`;
-                jbTgt.textContent = `stats targetDelay: ${targetDelayMs === null ? "--" : targetDelayMs.toFixed(1)} ms`;
-                pkLoss.textContent = `packetsLost: ${typeof s.packetsLost === "number" ? s.packetsLost : "--"}`;
-                jitterEl.textContent = `jitter: ${jitterMs === null ? "--" : jitterMs.toFixed(2)} ms`;
-                dropEl.textContent = `framesDropped: ${typeof s.framesDropped === "number" ? s.framesDropped : "--"}`;
-                break;
-              }
-            }
-          } catch (e) {
-            // ignore intermittent stats errors
-          }
-        }, 1000);
-      }
-
-      jbRange.addEventListener("input", () => {
-        jbSet.textContent = `set: ${jbRange.value} ms`;
-      });
-
-      applyJbBtn.onclick = () => {
-        if (!pc) return;
-        const target = Number(jbRange.value);
-        const res = setVideoJitterBufferTarget(pc, target);
-        if (res.ok) {
-          log("set jitterBufferTarget =", target, "ms");
-        } else {
-          log("set jitterBufferTarget failed:", res.reason);
-        }
-        updateJbSupportUI();
-      };
-
       async function start() {
         setEnabled(false);
-        setJbEnabled(false);
 
         pc = new RTCPeerConnection({
           iceServers: [
@@ -256,35 +134,31 @@
         });
 
         pc.ontrack = (evt) => { video.srcObject = evt.streams[0]; };
-
-        pc.oniceconnectionstatechange = () => log("iceConnectionState:", pc.iceConnectionState);
-        pc.onconnectionstatechange = () => log("connectionState:", pc.connectionState);
-
         pc.addTransceiver("video", { direction: "recvonly" });
 
         dc = pc.createDataChannel("control");
-        dc.onopen = () => { setEnabled(true); setJbEnabled(true); log("DataChannel open"); };
-        dc.onclose = () => { setEnabled(false); setJbEnabled(false); log("DataChannel closed"); };
+        dc.onopen = () => { setEnabled(true); log("DataChannel open"); };
+        dc.onclose = () => { setEnabled(false); log("DataChannel closed"); };
 
         dc.onmessage = (e) => {
           let msg;
           try { msg = JSON.parse(e.data); } catch { return; }
 
           if (msg.type === "stats") {
-            qEl.textContent = `frame_q: ${msg.frame_q}`;
+            qEl.textContent = `frame_q: ${msg.frame_q} (target=${msg.target_q})`;
             infEl.textContent = `infer_id/idx: ${msg.infer_id}/${msg.frame_index}`;
-            fpsEl.textContent = `fps: ${msg.output_fps}`;
-            imEl.textContent = `last_infer_ms: ${msg.last_infer_ms}`;
-            scEl.textContent = `scale/target: ${msg.scale} / ${msg.target_q}`;
+
+            sendEl.textContent = `send_fps: ${msg.send_fps} (base=${msg.send_base_fps}, range=${msg.send_range[0]}-${msg.send_range[1]})`;
+            inferEl.textContent = `infer_fps: ${msg.infer_fps} (base=${msg.infer_base_fps}, range=${msg.infer_range[0]}-${msg.infer_range[1]})`;
+
             eqEl.textContent = `est_queue: ${msg.est_queue_ms} ms`;
+            imEl.textContent = `last_infer_ms: ${msg.last_infer_ms}`;
             qbEl.textContent = `q_before/q_after: ${msg.last_q_before}/${msg.last_q_after}`;
             return;
           }
 
           if (msg.type === "infer_stats") {
             qbEl.textContent = `q_before/q_after: ${msg.q_before}/${msg.q_after}`;
-            // 可选：log 更详细
-            // log("INFER_STATS", msg);
             return;
           }
 
@@ -318,7 +192,7 @@
 
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
-        try { await waitIceComplete(pc, 8000); } catch (e) { log("WARN:", String(e)); }
+        try { await waitIceComplete(pc, 8000); } catch {}
 
         const resp = await fetch("/offer", {
           method: "POST",
@@ -328,19 +202,6 @@
 
         const answer = await resp.json();
         await pc.setRemoteDescription(answer);
-
-        // After remote is set, receiver is ready
-        updateJbSupportUI();
-
-        // Apply initial target from slider
-        const initTarget = Number(jbRange.value);
-        const res = setVideoJitterBufferTarget(pc, initTarget);
-        log("initial jitterBufferTarget:", initTarget, "ms", res.ok ? "OK" : ("FAIL " + res.reason));
-        updateJbSupportUI();
-
-        // Start inbound jitter buffer stats loop
-        startJitterStats(pc);
-
         log("WebRTC negotiation done");
       }
 

@@ -24,13 +24,10 @@ except Exception:
     cv2 = None
 
 
-FRAMES_PER_INFER = 16
-
 ICE_CONFIG = RTCConfiguration(
     iceServers=[
         RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
         RTCIceServer(urls=["stun:stun1.l.google.com:19302"]),
-        # 如云上仍 failed，需要 TURN
     ]
 )
 
@@ -65,21 +62,17 @@ class FrameItem:
     img: np.ndarray
     infer_id: int
     frame_index: int
-    user_actions: List[Action]  # every frame carries user_actions for robustness
+    user_actions: List[Action]  # every frame carries user_actions
 
 
 class BatchEngine:
     """
-    蓝色正弦波纹。
-    blank action 不改变颜色状态；
-    user action 出现则推进 color_phase（颜色变化）。
+    蓝色正弦波纹：blank action 不改变颜色；user action 触发颜色变化
     """
-    def __init__(self, w=640, h=360, frames_per_infer=16):
+    def __init__(self, w=640, h=360):
         self.w = w
         self.h = h
-        self.frames_per_infer = frames_per_infer
         self.global_frame_seq = 0
-
         self.color_phase = 0.0
         self.speed = 1.0
         self.freq = 6.0
@@ -90,41 +83,41 @@ class BatchEngine:
         self.rr = np.sqrt(xx * xx + yy * yy).astype(np.float32)
 
     def _apply_actions(self, actions: List[Action]):
-        user_cnt = sum(1 for a in actions if a.is_user and a.id)
-        if user_cnt > 0:
+        if any(a.is_user and a.id for a in actions):
             self.color_phase += 0.8
 
-    def infer(self, infer_id: int, actions: List[Action], output_fps: float) -> List[np.ndarray]:
+    def infer(self, infer_id: int, actions: List[Action], anim_fps: float, frames_per_infer: int) -> List[np.ndarray]:
         self._apply_actions(actions)
         user_texts = [a.text for a in actions if a.is_user and a.id]
         actions_text = " | ".join(user_texts) if user_texts else "(none)"
 
-        frames: List[np.ndarray] = []
         cp = self.color_phase
         base_r = 0.20 + 0.20 * np.sin(cp + 0.0)
         base_g = 0.25 + 0.25 * np.sin(cp + 2.1)
         base_b = 0.75 + 0.20 * np.sin(cp + 4.2)
 
-        for _ in range(self.frames_per_infer):
-            t = (self.global_frame_seq / max(output_fps, 1e-6)) * self.speed
+        frames: List[np.ndarray] = []
+        for _ in range(frames_per_infer):
+            t = (self.global_frame_seq / max(anim_fps, 1e-6)) * self.speed
             phase = self.freq * self.rr * (2.0 * np.pi) - t
             wave = (np.sin(phase) * 0.5 + 0.5).astype(np.float32)
 
-            r = (wave * base_r)
-            g = (wave * base_g)
-            b = (wave * base_b)
-
+            r = wave * base_r
+            g = wave * base_g
+            b = wave * base_b
             img = np.stack([r, g, b], axis=-1)
             img = (img * 255.0).clip(0, 255).astype(np.uint8)
 
             if cv2 is not None:
                 bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
                 cv2.putText(bgr, f"infer_id: {infer_id}", (12, 28),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(bgr, f"global_frame: {self.global_frame_seq}", (12, 56),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(bgr, f"user_actions: {actions_text[:70]}", (12, 84),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.putText(bgr, f"frames_per_infer: {frames_per_infer}", (12, 112),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
             frames.append(img)
@@ -133,72 +126,88 @@ class BatchEngine:
         return frames
 
 
-class PIController:
+class AdaptiveFpsController:
     """
-    e = qsize - target_q
-    e>0 -> queue too big -> scale↑ (infer slower)
-    e<0 -> queue too small -> scale↓ (infer faster)
+    不用 PID：带滞回 + 平滑(EMA) 的自适应 fps 控制器。
+
+    direction:
+      +1: q 高 -> fps 增加（用于 send）
+      -1: q 高 -> fps 减少（用于 infer）
     """
     def __init__(
         self,
-        target_q: float = 8.0,
-        kp: float = 0.06,
-        ki: float = 0.02,
-        scale_min: float = 0.60,
-        scale_max: float = 3.00,
-        integrator_min: float = -20.0,
-        integrator_max: float = 20.0,
+        base_fps: float,
+        min_fps: float,
+        max_fps: float,
+        target_q: int = 8,
+        hyst: int = 2,
+        up_gain: float = 0.10,
+        down_gain: float = 0.08,
+        relax_gain: float = 0.03,
+        ema: float = 0.18,
+        direction: int = +1,
     ):
-        self.target_q = float(target_q)
-        self.kp = float(kp)
-        self.ki = float(ki)
-        self.scale_min = float(scale_min)
-        self.scale_max = float(scale_max)
-        self.integrator_min = float(integrator_min)
-        self.integrator_max = float(integrator_max)
+        self.base_fps = float(base_fps)
+        self.min_fps = float(min_fps)
+        self.max_fps = float(max_fps)
+        self.target_q = int(target_q)
+        self.hyst = int(hyst)
+        self.up_gain = float(up_gain)
+        self.down_gain = float(down_gain)
+        self.relax_gain = float(relax_gain)
+        self.ema = float(ema)
+        self.direction = +1 if direction >= 0 else -1
 
-        self.integral = 0.0
-        self.scale = 1.0
-        self._last_t = time.time()
+        self.fps = float(base_fps)
 
-    def update(self, qsize: float) -> float:
-        now = time.time()
-        dt = max(0.001, now - self._last_t)
-        self._last_t = now
+    def update(self, qsize: int) -> float:
+        q = int(qsize)
+        desired = self.fps
 
-        e = float(qsize) - self.target_q
+        hi = self.target_q + self.hyst
+        lo = self.target_q - self.hyst
 
-        self.integral += e * dt
-        self.integral = max(self.integrator_min, min(self.integrator_max, self.integral))
+        if q > hi:
+            err = q - hi
+            if self.direction > 0:
+                desired = self.fps * (1.0 + self.up_gain) + 0.12 * err
+            else:
+                desired = self.fps * (1.0 - self.down_gain) - 0.06 * err
+        elif q < lo:
+            err = lo - q
+            if self.direction > 0:
+                desired = self.fps * (1.0 - self.down_gain) - 0.06 * err
+            else:
+                desired = self.fps * (1.0 + self.up_gain) + 0.12 * err
+        else:
+            desired = self.fps + (self.base_fps - self.fps) * self.relax_gain
 
-        u = self.kp * e + self.ki * self.integral
-        scale = 1.0 + u
-        scale = max(self.scale_min, min(self.scale_max, scale))
-        self.scale = scale
-        return scale
+        desired = max(self.min_fps, min(self.max_fps, desired))
+        self.fps = (1.0 - self.ema) * self.fps + self.ema * desired
+        self.fps = max(self.min_fps, min(self.max_fps, self.fps))
+        return self.fps
 
 
 class Pipeline:
     def __init__(
         self,
         engine: BatchEngine,
-        output_fps: float,
-        sim_infer_ms: int,
-        frame_queue_max: int,
+        infer_fps_ctrl: AdaptiveFpsController,
         actions_per_infer: int,
         frames_per_infer: int,
+        sim_infer_ms: int,
+        frame_queue_max: int,
         action_collect_timeout_sec: float,
-        controller: PIController,
         infer_in_thread: bool = True,
     ):
         self.engine = engine
-        self.output_fps = float(output_fps)
-        self.sim_infer_ms = int(sim_infer_ms)
-        self.action_collect_timeout_sec = float(action_collect_timeout_sec)
-        self.controller = controller
-        self.infer_in_thread = bool(infer_in_thread)
+        self.infer_fps_ctrl = infer_fps_ctrl
         self.actions_per_infer = int(actions_per_infer)
         self.frames_per_infer = int(frames_per_infer)
+        self.sim_infer_ms = int(sim_infer_ms)
+        self.action_collect_timeout_sec = float(action_collect_timeout_sec)
+        self.infer_in_thread = bool(infer_in_thread)
+
         self.action_q: asyncio.Queue[Action] = asyncio.Queue()
         self.frame_q: asyncio.Queue[FrameItem] = asyncio.Queue(maxsize=frame_queue_max)
         self.datachannels: Set = set()
@@ -208,12 +217,13 @@ class Pipeline:
         self._infer_id = 0
 
         self._last_frame: Optional[FrameItem] = None
+
         self._last_infer_ms: float = 0.0
-        self._last_scale: float = 1.0
         self._last_q_before: int = 0
         self._last_q_after: int = 0
+        self._last_infer_fps: float = float(infer_fps_ctrl.base_fps)
 
-        self._last_infer_stats_push_t = 0.0
+        self._last_infer_stats_push = 0.0
 
     def add_dc(self, dc):
         self.datachannels.add(dc)
@@ -285,21 +295,20 @@ class Pipeline:
             return item
 
     async def _run(self):
-        base_period = self.frames_per_infer / max(self.output_fps, 1e-6)
         next_tick = time.time()
 
         while not self._stop.is_set():
-            # adaptive control based on current queue size
             q_now = self.frame_q.qsize()
-            scale = self.controller.update(q_now)
-            self._last_scale = scale
-            infer_period_sec = base_period * scale
+            infer_fps = self.infer_fps_ctrl.update(q_now)
+            self._last_infer_fps = infer_fps
+
+            infer_period = self.frames_per_infer / max(infer_fps, 1e-6)
 
             now = time.time()
             if now < next_tick:
                 await asyncio.sleep(min(0.01, next_tick - now))
                 continue
-            next_tick = now + infer_period_sec
+            next_tick = now + infer_period
 
             actions = await self._collect_actions_for_one_infer()
             user_actions = [a for a in actions if a.is_user and a.id]
@@ -307,7 +316,7 @@ class Pipeline:
             self._infer_id += 1
             infer_id = self._infer_id
 
-            # infer_start (user actions only)
+            # infer_start (user only)
             t_start_ms = int(time.time() * 1000)
             for a in user_actions:
                 self.broadcast({
@@ -318,33 +327,33 @@ class Pipeline:
                     "t_server_ms": t_start_ms,
                 })
 
-            # overlap evidence: q_before/q_after across inference duration
             q_before = self.frame_q.qsize()
-            infer_t0 = time.time()
+            t0 = time.time()
 
-            # simulate compute without blocking event loop
             if self.sim_infer_ms > 0:
                 await asyncio.sleep(self.sim_infer_ms / 1000.0)
 
-            # run engine.infer in a background thread (so recv() keeps running)
             if self.infer_in_thread:
-                frames = await asyncio.to_thread(self.engine.infer, infer_id, actions, self.output_fps)
+                frames = await asyncio.to_thread(
+                    self.engine.infer, infer_id, actions, infer_fps, self.frames_per_infer
+                )
             else:
-                frames = self.engine.infer(infer_id, actions, self.output_fps)
+                frames = self.engine.infer(infer_id, actions, infer_fps, self.frames_per_infer)
 
-            infer_t1 = time.time()
+            t1 = time.time()
             q_after = self.frame_q.qsize()
 
             self._last_q_before = int(q_before)
             self._last_q_after = int(q_after)
 
-            infer_ms = (infer_t1 - infer_t0) * 1000.0
+            infer_ms = (t1 - t0) * 1000.0
             self._last_infer_ms = infer_ms
 
             print(f"[INFER] infer_id={infer_id:4d} dt={infer_ms:7.1f}ms "
-                  f"q_before={q_before:3d} q_after={q_after:3d} scale={self._last_scale:.3f}")
+                  f"q_before={q_before:3d} q_after={q_after:3d} infer_fps={infer_fps:5.2f} "
+                  f"actions_per_infer={self.actions_per_infer} frames_per_infer={self.frames_per_infer}")
 
-            # infer_end (user actions only)
+            # infer_end (user only)
             t_end_ms = int(time.time() * 1000)
             for a in user_actions:
                 self.broadcast({
@@ -356,7 +365,7 @@ class Pipeline:
                     "t_server_ms": t_end_ms,
                 })
 
-            # enqueue 16 frames; drop-oldest on overflow
+            # enqueue frames; drop-oldest on overflow
             for idx, img in enumerate(frames):
                 if self.frame_q.full():
                     try:
@@ -370,49 +379,56 @@ class Pipeline:
                     user_actions=user_actions,
                 ))
 
-            # push infer_stats (contains q_before/q_after) to browser
+            # push infer_stats (low rate)
             t = time.time()
-            if t - self._last_infer_stats_push_t > 0.25:
-                self._last_infer_stats_push_t = t
+            if t - self._last_infer_stats_push > 0.25:
+                self._last_infer_stats_push = t
                 self.broadcast({
                     "type": "infer_stats",
                     "infer_id": infer_id,
                     "infer_ms": round(infer_ms, 2),
-                    "frame_q_after_enqueue": self.frame_q.qsize(),
-                    "scale": round(self._last_scale, 3),
-                    "target_q": self.controller.target_q,
-                    "base_period_ms": round(base_period * 1000.0, 2),
-                    "infer_period_ms": round(infer_period_sec * 1000.0, 2),
                     "q_before": int(q_before),
                     "q_after": int(q_after),
+                    "frame_q_after_enqueue": self.frame_q.qsize(),
+                    "infer_fps": round(infer_fps, 3),
+                    "infer_period_ms": round(infer_period * 1000.0, 2),
+                    "actions_per_infer": self.actions_per_infer,
+                    "frames_per_infer": self.frames_per_infer,
                     "ts_ms": int(time.time() * 1000),
                 })
 
 
-class PipelineVideoTrack(VideoStreamTrack):
+class AdaptiveSendVideoTrack(VideoStreamTrack):
     kind = "video"
 
-    def __init__(self, pipeline: Pipeline):
+    def __init__(self, pipeline: Pipeline, send_fps_ctrl: AdaptiveFpsController):
         super().__init__()
         self.pipeline = pipeline
-        self._interval = 1.0 / max(self.pipeline.output_fps, 1e-6)
-        self._last = None
+        self.send_fps_ctrl = send_fps_ctrl
 
+        self._last_send_t: Optional[float] = None
         self._applied_sent_for_infer: Set[int] = set()
+
         self._last_log_t = 0.0
         self._last_stats_push_t = 0.0
 
+        self._last_send_fps: float = float(send_fps_ctrl.base_fps)
+
     async def recv(self):
-        # throttle by output_fps
+        qsize = self.pipeline.frame_q.qsize()
+        send_fps = self.send_fps_ctrl.update(qsize)
+        self._last_send_fps = send_fps
+        interval = 1.0 / max(send_fps, 1e-6)
+
         now = time.time()
-        if self._last is not None:
-            delay = self._interval - (now - self._last)
+        if self._last_send_t is not None:
+            delay = interval - (now - self._last_send_t)
             if delay > 0:
                 await asyncio.sleep(delay)
-        self._last = time.time()
+        self._last_send_t = time.time()
 
         item = await self.pipeline.get_frame_item()
-        qsize = self.pipeline.frame_q.qsize()
+        q2 = self.pipeline.frame_q.qsize()
 
         # applied: when this infer's first dequeued frame is about to be sent
         if item.infer_id not in self._applied_sent_for_infer and item.user_actions:
@@ -427,27 +443,37 @@ class PipelineVideoTrack(VideoStreamTrack):
                     "t_server_ms": t_applied_ms,
                 })
 
-        # stdout: frame_q tracing
         t = time.time()
         if t - self._last_log_t > 0.5:
             self._last_log_t = t
-            print(f"[FRAME_Q] size={qsize:3d} | infer_id={item.infer_id:4d} | idx={item.frame_index:2d} "
-                  f"| scale={self.pipeline._last_scale:.3f} | q_before/after={self.pipeline._last_q_before}/{self.pipeline._last_q_after}")
+            print(f"[FRAME_Q] size={q2:3d} infer_id={item.infer_id:4d} idx={item.frame_index:2d} "
+                  f"send_fps={send_fps:5.2f} infer_fps={self.pipeline._last_infer_fps:5.2f} "
+                  f"q_before/after={self.pipeline._last_q_before}/{self.pipeline._last_q_after}")
 
-        # push stats to browser
         if t - self._last_stats_push_t > 0.5:
             self._last_stats_push_t = t
-            est_queue_ms = (qsize / max(self.pipeline.output_fps, 1e-6)) * 1000.0
+            est_queue_ms = (q2 / max(send_fps, 1e-6)) * 1000.0
             self.pipeline.broadcast({
                 "type": "stats",
-                "frame_q": qsize,
+                "frame_q": q2,
                 "infer_id": item.infer_id,
                 "frame_index": item.frame_index,
-                "output_fps": self.pipeline.output_fps,
-                "last_infer_ms": round(self.pipeline._last_infer_ms, 2),
-                "scale": round(self.pipeline._last_scale, 3),
-                "target_q": self.pipeline.controller.target_q,
+
+                "send_fps": round(send_fps, 3),
+                "send_base_fps": round(self.send_fps_ctrl.base_fps, 3),
+                "send_range": [round(self.send_fps_ctrl.min_fps, 2), round(self.send_fps_ctrl.max_fps, 2)],
+
+                "infer_fps": round(self.pipeline._last_infer_fps, 3),
+                "infer_base_fps": round(self.pipeline.infer_fps_ctrl.base_fps, 3),
+                "infer_range": [round(self.pipeline.infer_fps_ctrl.min_fps, 2), round(self.pipeline.infer_fps_ctrl.max_fps, 2)],
+
+                "actions_per_infer": self.pipeline.actions_per_infer,
+                "frames_per_infer": self.pipeline.frames_per_infer,
+
+                "target_q": self.send_fps_ctrl.target_q,
                 "est_queue_ms": round(est_queue_ms, 1),
+
+                "last_infer_ms": round(self.pipeline._last_infer_ms, 2),
                 "last_q_before": self.pipeline._last_q_before,
                 "last_q_after": self.pipeline._last_q_after,
                 "ts_ms": int(time.time() * 1000),
@@ -463,7 +489,7 @@ class PipelineVideoTrack(VideoStreamTrack):
 pcs = set()
 
 
-def make_app(pipeline: Pipeline):
+def make_app(pipeline: Pipeline, send_fps_ctrl: AdaptiveFpsController):
     app = web.Application()
 
     async def index(request):
@@ -477,7 +503,7 @@ def make_app(pipeline: Pipeline):
         pc = RTCPeerConnection(ICE_CONFIG)
         pcs.add(pc)
 
-        pc.addTrack(PipelineVideoTrack(pipeline))
+        pc.addTrack(AdaptiveSendVideoTrack(pipeline, send_fps_ctrl))
 
         @pc.on("datachannel")
         def on_datachannel(dc):
@@ -512,7 +538,7 @@ def make_app(pipeline: Pipeline):
                 )
                 asyncio.create_task(pipeline.enqueue_action(a))
 
-                # ack: received + enqueued
+                # ACK
                 try:
                     dc.send(json.dumps({
                         "type": "ack",
@@ -555,51 +581,79 @@ def make_app(pipeline: Pipeline):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--host", default="0.0.0.0")
-    p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--port", type=int, default=8090)
 
-    p.add_argument("--fps", type=float, default=30.0, help="OUTPUT_FPS")
-    p.add_argument("--frames-per-infer", type=int, default=16)
-    p.add_argument("--actions-per-infer", type=int, default=4)
-    p.add_argument("--sim-infer-ms", type=int, default=0, help="simulate infer time in ms (non-blocking)")
+    # NEW: make these configurable
+    p.add_argument("--actions-per-infer", type=int, default=1)
+    p.add_argument("--frames-per-infer", type=int, default=4)
+
+    # inference simulation
+    p.add_argument("--sim-infer-ms", type=int, default=120)
     p.add_argument("--frame-queue-max", type=int, default=128)
     p.add_argument("--action-collect-timeout-ms", type=int, default=30)
+    p.add_argument("--infer-in-thread", action="store_true", default=True)
 
-    # adaptive PI control parameters
-    p.add_argument("--target-q", type=float, default=8.0)
-    p.add_argument("--kp", type=float, default=0.00)
-    p.add_argument("--ki", type=float, default=0.00)
-    p.add_argument("--scale-min", type=float, default=0.00)
-    p.add_argument("--scale-max", type=float, default=4.00)
+    # shared queue target
+    p.add_argument("--target-q", type=int, default=8)
+    p.add_argument("--hyst", type=int, default=2)
 
-    p.add_argument("--infer-in-thread", action="store_true", default=True,
-                   help="run engine.infer in background thread to overlap with recv()")
+    # adaptive infer fps (production): q high -> infer_fps down
+    p.add_argument("--infer-base-fps", type=float, default=20.0)
+    p.add_argument("--infer-min-fps", type=float, default=16.0)
+    p.add_argument("--infer-max-fps", type=float, default=22.0)
+
+    # adaptive send fps (consumption): q high -> send_fps up
+    p.add_argument("--send-base-fps", type=float, default=20.0)
+    p.add_argument("--send-min-fps", type=float, default=16.0)
+    p.add_argument("--send-max-fps", type=float, default=22.0)
+
     args = p.parse_args()
 
-    engine = BatchEngine(w=640, h=360, frames_per_infer=args.frames_per_infer)
-    controller = PIController(
+    if args.actions_per_infer < 1:
+        raise SystemExit("--actions-per-infer must be >= 1")
+    if args.frames_per_infer < 1:
+        raise SystemExit("--frames-per-infer must be >= 1")
+
+    engine = BatchEngine(w=640, h=360)
+
+    infer_fps_ctrl = AdaptiveFpsController(
+        base_fps=args.infer_base_fps,
+        min_fps=args.infer_min_fps,
+        max_fps=args.infer_max_fps,
         target_q=args.target_q,
-        kp=args.kp,
-        ki=args.ki,
-        scale_min=args.scale_min,
-        scale_max=args.scale_max
+        hyst=args.hyst,
+        direction=-1,  # q high -> infer fps down
+        ema=0.18,
+    )
+
+    send_fps_ctrl = AdaptiveFpsController(
+        base_fps=args.send_base_fps,
+        min_fps=args.send_min_fps,
+        max_fps=args.send_max_fps,
+        target_q=args.target_q,
+        hyst=args.hyst,
+        direction=+1,  # q high -> send fps up
+        ema=0.18,
     )
 
     pipeline = Pipeline(
         engine=engine,
-        output_fps=args.fps,
+        infer_fps_ctrl=infer_fps_ctrl,
+        actions_per_infer=args.actions_per_infer,
+        frames_per_infer=args.frames_per_infer,
         sim_infer_ms=args.sim_infer_ms,
         frame_queue_max=args.frame_queue_max,
         action_collect_timeout_sec=args.action_collect_timeout_ms / 1000.0,
-        controller=controller,
         infer_in_thread=args.infer_in_thread,
-        actions_per_infer=args.actions_per_infer,
-        frames_per_infer=args.frames_per_infer
     )
 
-    print(f"[CTRL] target_q={controller.target_q} kp={controller.kp} ki={controller.ki} "
-          f"scale_range=[{controller.scale_min},{controller.scale_max}] infer_in_thread={args.infer_in_thread}")
+    print(f"[CFG] actions_per_infer={args.actions_per_infer} frames_per_infer={args.frames_per_infer}")
+    print(f"[TARGET] target_q={args.target_q} hyst={args.hyst}")
+    print(f"[INFER_FPS] base={infer_fps_ctrl.base_fps} range=[{infer_fps_ctrl.min_fps},{infer_fps_ctrl.max_fps}] (q high -> down)")
+    print(f"[SEND_FPS ] base={send_fps_ctrl.base_fps} range=[{send_fps_ctrl.min_fps},{send_fps_ctrl.max_fps}] (q high -> up)")
+    print(f"[INFER] sim_infer_ms={args.sim_infer_ms} infer_in_thread={args.infer_in_thread} frame_queue_max={args.frame_queue_max}")
 
-    web.run_app(make_app(pipeline), host=args.host, port=args.port)
+    web.run_app(make_app(pipeline, send_fps_ctrl), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
